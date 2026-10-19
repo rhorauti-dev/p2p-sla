@@ -1,0 +1,62 @@
+<suitelet scriptid="customscript_glo_p2p_sla_sl">
+  <description>Painel gerencial de SLA do procure-to-pay: requisicao, aprovacao, pedido de compra, aprovacao, recebimento, lancamento da NF e pagamento, por departamento, prioridade, aprovador, comprador e fornecedor. Somente leitura (SuiteQL). Metas de SLA em dias uteis no parametro Configuracao de SLA (JSON).</description>
+  <isinactive>F</isinactive>
+  <name>GLO_P2P_SLA_SL</name>
+  <notifyadmins>F</notifyadmins>
+  <notifyemails></notifyemails>
+  <notifyowner>T</notifyowner>
+  <notifyuser>F</notifyuser>
+  <scriptfile>[/SuiteScripts/P2P-SLA/GLO_P2P_SLA_SL.js]</scriptfile>
+  <scriptcustomfields>
+    <scriptcustomfield scriptid="custscript_glo_p2p_sla_config_ip">
+      <accesslevel>2</accesslevel>
+      <aidescription></aidescription>
+      <applyformatting>F</applyformatting>
+      <checkspelling>F</checkspelling>
+      <defaultchecked>F</defaultchecked>
+      <defaultselection></defaultselection>
+      <defaultvalue></defaultvalue>
+      <description>JSON com as metas em dias uteis. Vazio = padrao: aprovacao_req 2, emissao_po 3, aprovacao_po 2, entrega 15, lancamento 3, pagamento 0 (tolerancia apos o vencimento). Chaves opcionais: prioridade {id: {...}}, departamento {id: {...}}, feriados ["AAAA-MM-DD"].</description>
+      <displayheight></displayheight>
+      <displaytype>NORMAL</displaytype>
+      <displaywidth></displaywidth>
+      <dynamicdefault></dynamicdefault>
+      <fieldtype>CLOBTEXT</fieldtype>
+      <help><![CDATA[Metas do painel em DIAS UTEIS (sabado, domingo e feriados nao contam). Vazio = padrao: aprovacao_req 2, emissao_po 3, aprovacao_po 2, entrega 15, lancamento 3, pagamento 0 (dias de tolerancia apos o vencimento).
+Para mudar, escreva em JSON so o que for diferente:
+- geral: {"etapas":{"entrega":10}}
+- por prioridade (1 Alta, 2 Media, 3 Baixa): {"prioridade":{"1":{"emissao_po":1}}}
+- por departamento (ID interno): {"departamento":{"38":{"entrega":7}}}
+- feriados: {"feriados":["2026-11-20","2026-12-25"]}
+Pode juntar tudo num JSON so. Departamento vence prioridade, que vence o geral. JSON invalido: o painel avisa e usa o padrao. Metas em vigor: botao Metas de SLA do painel.]]></help>
+      <isformula>F</isformula>
+      <ismandatory>F</ismandatory>
+      <label>Configuracao de SLA</label>
+      <linktext></linktext>
+      <maxlength></maxlength>
+      <maxvalue></maxvalue>
+      <minvalue></minvalue>
+      <onparentdelete></onparentdelete>
+      <searchlevel>2</searchlevel>
+      <selectrecordtype></selectrecordtype>
+      <setting></setting>
+      <storevalue>T</storevalue>
+    </scriptcustomfield>
+  </scriptcustomfields>
+  <scriptdeployments>
+    <scriptdeployment scriptid="customdeploy_glo_p2p_sla_sl">
+      <allemployees>F</allemployees>
+      <allpartners>F</allpartners>
+      <allroles>T</allroles>
+      <audslctrole></audslctrole>
+      <custscript_glo_p2p_sla_config_ip></custscript_glo_p2p_sla_config_ip>
+      <eventtype></eventtype>
+      <isdeployed>T</isdeployed>
+      <isonline>F</isonline>
+      <loglevel>AUDIT</loglevel>
+      <runasrole>ADMINISTRATOR</runasrole>
+      <status>RELEASED</status>
+      <title>SLA Procure-to-Pay</title>
+    </scriptdeployment>
+  </scriptdeployments>
+</suitelet>

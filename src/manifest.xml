@@ -1,0 +1,14 @@
+<manifest projecttype="ACCOUNTCUSTOMIZATION">
+  <projectname>p2p-sla</projectname>
+  <frameworkversion>1.0</frameworkversion>
+  <dependencies>
+    <features>
+      <feature required="true">SERVERSIDESCRIPTING</feature>
+      <feature required="false">SUBSIDIARIES</feature>
+      <feature required="false">DEPARTMENTS</feature>
+      <feature required="false">PAYABLES</feature>
+      <feature required="false">ACCOUNTING</feature>
+      <feature required="false">CRM</feature>
+    </features>
+  </dependencies>
+</manifest>
