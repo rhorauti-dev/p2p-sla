@@ -217,3 +217,118 @@ test('filtro por departamento e situacao', () => {
     assert.equal(lib.filtrar(ciclos, { depto: 20 }).length, 2)
     assert.equal(lib.filtrar(ciclos, { situacao: 'concluido' }).length, 1)
 })
+
+// Fases do Manual de Procedimentos de Compras MPI-SUP-001 (03/08/2026), item 4.
+test('etapas seguem as fases do manual, na ordem', () => {
+    assert.deepEqual(j(lib.ETAPAS.map((e) => e.id)),
+        ['aprovacao_req', 'bid', 'propostas', 'negociacao', 'emissao_po', 'aprovacao_po', 'entrega', 'lancamento', 'pagamento'])
+    assert.deepEqual(j(lib.ETAPAS.map((e) => e.fase)), ['4.1', '4.2', '4.2', '4.3', '4.4', '4.5', '4.6 a 4.8', '4.9', '4.9'])
+    assert.equal(lib.ETAPAS.find((e) => e.id === 'aprovacao_po').responsavel, 'Head de Compras')
+    lib.ETAPAS.forEach((e) => assert.equal(typeof lib.SLA_PADRAO[e.id], 'number', 'meta padrao de ' + e.id))
+})
+
+// REQ 4: Bid com 3 convidados (2 responderam), duas rodadas, dois pedidos e pagamento antes do recebimento.
+// REQ 5: Bid enviado, ninguem respondeu. REQ 6: Bid em rascunho. REQ 7: Bid respondido por todos, sem rodada nem pedido.
+function dadosComBid() {
+    const req = (id, criada) => ({ id, tranid: String(id), criada, status: 'B', depto_id: 10, depto: 'Engenharia', prioridade_id: 1, sub_id: 4, total: 10 })
+    const auto = (doc, quando) => ({ doc, quando, de: '', para: 'Pedido pendente', quem: 'X' })
+    return {
+        reqs: [req(4, '2026-09-01T09:00:00'), req(5, '2026-10-12T09:00:00'), req(6, '2026-10-12T09:00:00'), req(7, '2026-10-12T09:00:00')],
+        reqNotas: [auto(4, '2026-09-01T09:00:00'), auto(5, '2026-10-12T09:00:00'), auto(6, '2026-10-12T09:00:00'), auto(7, '2026-10-12T09:00:00')],
+        bids: [
+            { id: 1004, name: 'BID-1004', req_id: 4, criado: '2026-09-01T10:00:00', envio: '2026-09-01T12:00:00' },
+            { id: 1005, name: 'BID-1005', req_id: 5, criado: '2026-10-12T10:00:00', envio: '2026-10-12T12:00:00' },
+            { id: 1006, name: 'BID-1006', req_id: 6, criado: '2026-10-12T10:00:00', envio: null },
+            { id: 1007, name: 'BID-1007', req_id: 7, criado: '2026-10-12T10:00:00', envio: '2026-10-12T12:00:00' }
+        ],
+        convidados: [
+            { bid_id: 1004, id: 1, respondido: '2026-09-02T12:00:00' },
+            { bid_id: 1004, id: 2, respondido: '2026-09-03T12:00:00' },
+            { bid_id: 1004, id: 3, respondido: null },
+            { bid_id: 1005, id: 4, respondido: null },
+            { bid_id: 1007, id: 5, respondido: '2026-10-13T12:00:00' },
+            { bid_id: 1007, id: 6, respondido: '2026-10-14T12:00:00' },
+            { bid_id: 1007, id: 7, respondido: '2026-10-15T12:00:00' }
+        ],
+        rodadas: [
+            { bid_id: 1004, cot_id: 1, rodada: 1, data: '2026-09-02T12:00:00' },
+            { bid_id: 1004, cot_id: 1, rodada: 2, data: '2026-09-04T09:00:00' },
+            { bid_id: 1004, cot_id: 2, rodada: 1, data: '2026-09-03T12:00:00' },
+            { bid_id: 1007, cot_id: 3, rodada: 1, data: '2026-10-13T12:00:00' }
+        ],
+        pos: [
+            { req_id: 4, id: 41, tranid: 'PO41', criado: '2026-09-07T09:00:00', status: 'G', fornecedor: 'F1', comprador: 'Glaucia', total: 100 },
+            { req_id: 4, id: 42, tranid: 'PO42', criado: '2026-09-08T09:00:00', status: 'G', fornecedor: 'F2', comprador: 'Glaucia', total: 100 }
+        ],
+        poNotas: [auto(41, '2026-09-07T09:00:00'), auto(42, '2026-09-08T09:00:00')],
+        recebimentos: [{ po_id: 41, id: 51, data: '2026-09-20' }, { po_id: 42, id: 52, data: '2026-09-20' }],
+        contas: [{ po_id: 41, id: 61, criada: '2026-09-10T09:00:00', vencimento: '2026-09-30', status: 'B', total: 100 }],
+        pagamentos: [{ conta_id: 61, id: 71, data: '2026-09-15' }]
+    }
+}
+
+test('bid: convites, propostas e negociacao medidos ate o pedido', () => {
+    const c = lib.montarCiclos(dadosComBid(), CFG, HOJE).find((x) => x.chave === '4-41')
+    assert.equal(c.bid.id, 1004)
+    assert.equal(c.marcos.convites_enviados, '2026-09-01T12:00:00')
+    assert.equal(c.etapas.bid.dias, lib.diasUteis('2026-09-01T09:00:00', '2026-09-01T12:00:00'))
+    // Um convidado nao respondeu, mas Compras seguiu: a fase fecha na ultima proposta recebida.
+    assert.equal(c.marcos.propostas, '2026-09-03T12:00:00')
+    assert.equal(c.etapas.propostas.situacao, 'no_prazo')
+    // A rodada 1 e a proposta inicial; negociacao e rodada 2 em diante.
+    assert.equal(c.marcos.negociado, '2026-09-04T09:00:00')
+    assert.equal(c.etapas.negociacao.dias, lib.diasUteis('2026-09-03T12:00:00', '2026-09-04T09:00:00'))
+    assert.equal(c.etapas.emissao_po.inicio, '2026-09-04T09:00:00')
+    assert.deepEqual(j(c.cotacao), { convidados: 3, propostas: 2, rodadas: 2, minimoAtendido: false })
+})
+
+test('bid: sem rodada de negociacao, a emissao conta das propostas', () => {
+    const d = dadosComBid()
+    d.rodadas = d.rodadas.filter((r) => r.rodada === 1)
+    const c = lib.montarCiclos(d, CFG, HOJE).find((x) => x.chave === '4-41')
+    assert.equal(c.etapas.negociacao.situacao, 'nao_se_aplica')
+    assert.equal(c.etapas.emissao_po.inicio, '2026-09-03T12:00:00')
+})
+
+test('bid: requisicao sem Bid nao mede as fases 4.2 e 4.3 e a emissao conta da aprovacao', () => {
+    const c = lib.montarCiclos(dados(), CFG, HOJE).find((x) => x.chave === '1-11')
+    assert.equal(c.bid, null)
+    assert.equal(c.etapas.bid.situacao, 'sem_bid')
+    assert.equal(c.etapas.propostas.situacao, 'sem_bid')
+    assert.equal(c.etapas.negociacao.situacao, 'sem_bid')
+    assert.equal(c.etapas.emissao_po.inicio, '2026-09-02T09:00:00')
+    assert.equal(c.cotacao.minimoAtendido, false)
+})
+
+test('bid: processo parado mostra a fase do Bid em que esta', () => {
+    const ciclos = lib.montarCiclos(dadosComBid(), CFG, HOJE)
+    const atual = (k) => ciclos.find((x) => x.chave === k)
+    assert.equal(atual('5-0').etapaAtual, 'propostas')
+    assert.equal(atual('5-0').etapas.propostas.inicio, '2026-10-12T12:00:00')
+    assert.equal(atual('6-0').etapaAtual, 'bid')
+    assert.equal(atual('6-0').etapas.propostas.situacao, 'pendente')
+    // Todos responderam: a fase de propostas fecha e o processo esta na negociacao.
+    assert.equal(atual('7-0').marcos.propostas, '2026-10-15T12:00:00')
+    assert.equal(atual('7-0').etapaAtual, 'negociacao')
+    assert.equal(atual('7-0').etapas.emissao_po.situacao, 'pendente')
+    assert.equal(atual('7-0').cotacao.minimoAtendido, true)
+})
+
+test('pagamento antes do recebimento e sinalizado (manual 4.9)', () => {
+    const ciclos = lib.montarCiclos(dadosComBid(), CFG, HOJE)
+    assert.equal(ciclos.find((x) => x.chave === '4-41').pagoAntesDoRecebimento, true)
+    assert.equal(ciclos.find((x) => x.chave === '4-42').pagoAntesDoRecebimento, false)
+    assert.equal(lib.montarCiclos(dados(), CFG, HOJE).find((x) => x.chave === '1-11').pagoAntesDoRecebimento, false)
+})
+
+test('agregados: fases do Bid contam uma vez por requisicao e a conformidade vem nos kpis', () => {
+    const ag = lib.agregar(lib.montarCiclos(dadosComBid(), CFG, HOJE))
+    assert.equal(ag.porEtapa.find((e) => e.id === 'negociacao').concluidas, 1, 'REQ 4 tem dois pedidos')
+    assert.equal(ag.porEtapa.find((e) => e.id === 'propostas').concluidas, 2)
+    assert.equal(ag.kpis.reqComBid, 4)
+    assert.equal(ag.kpis.reqMinimoCotacoes, 1)
+    assert.equal(ag.kpis.pagoAntesDoRecebimento, 1)
+    const sem = lib.agregar(lib.montarCiclos(dados(), CFG, HOJE))
+    assert.equal(sem.kpis.reqComBid, 0)
+    assert.equal(sem.porEtapa.find((e) => e.id === 'bid').concluidas, 0)
+})

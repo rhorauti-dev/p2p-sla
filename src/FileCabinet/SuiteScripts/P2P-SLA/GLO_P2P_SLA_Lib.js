@@ -11,11 +11,21 @@
  *   req_criada   createddate da Requisicao
  *   req_aprovada primeira saida do status "Aprovacao do supervisor pendente"
  *                (systemnote TRANDOC.KSTATUS); sem esse status = aprovacao automatica
+ *   convites_enviados  data de envio do primeiro Bid da requisicao (projeto P2P - Req)
+ *   propostas    ultima resposta de fornecedor convidado, quando todos responderam
+ *                ou quando Compras seguiu adiante (houve rodada ou pedido)
+ *   negociado    ultima rodada de negociacao (rodada 2 em diante; a 1 e a proposta
+ *                inicial), fechada quando o pedido nasce: o Bid nao grava a data em
+ *                que a Cotacao vira "Vencedor"
  *   po_criado    createddate do PO
  *   po_aprovado  idem, no PO
  *   recebido     trandate do primeiro Recebimento do PO
  *   nf_lancada   createddate da primeira Conta a pagar do PO
  *   pago         trandate do ultimo Pagamento, quando todas as contas estao pagas
+ *
+ * Etapas = fases do Manual de Procedimentos de Compras MPI-SUP-001 (03/08/2026),
+ * item 4. Requisicao sem Bid nao mede 4.2 e 4.3 ("sem_bid") e a emissao conta
+ * da aprovacao da requisicao.
  *
  * Etapas medem em dias uteis (sabado, domingo e feriados da configuracao fora).
  * Pagamento nao mede duracao contra SLA: compara a data do pagamento com o
@@ -28,17 +38,25 @@ define([], () => {
 
     const DIA = 86400000
 
+    // porRequisicao: a etapa conta uma vez por requisicao, nao uma vez por pedido.
     const ETAPAS = [
-        { id: 'aprovacao_req', nome: 'Aprovação da requisição', responsavel: 'Gestor do departamento', de: 'req_criada', ate: 'req_aprovada' },
-        { id: 'emissao_po', nome: 'Emissão do pedido', responsavel: 'Compras', de: 'req_aprovada', ate: 'po_criado' },
-        { id: 'aprovacao_po', nome: 'Aprovação do pedido', responsavel: 'Aprovador do pedido', de: 'po_criado', ate: 'po_aprovado' },
-        { id: 'entrega', nome: 'Entrega do fornecedor', responsavel: 'Fornecedor / Compras', de: 'po_aprovado', ate: 'recebido' },
-        { id: 'lancamento', nome: 'Lançamento da NF', responsavel: 'Fiscal / Contas a pagar', de: 'recebido', ate: 'nf_lancada' },
-        { id: 'pagamento', nome: 'Pagamento', responsavel: 'Financeiro', de: 'nf_lancada', ate: 'pago' }
+        { id: 'aprovacao_req', fase: '4.1', nome: 'Aprovação da requisição', responsavel: 'Gestor do departamento', de: 'req_criada', ate: 'req_aprovada', porRequisicao: true },
+        { id: 'bid', fase: '4.2', nome: 'Bid e convites', responsavel: 'Compras', de: 'req_aprovada', ate: 'convites_enviados', porRequisicao: true },
+        { id: 'propostas', fase: '4.2', nome: 'Propostas dos fornecedores', responsavel: 'Fornecedores', de: 'convites_enviados', ate: 'propostas', porRequisicao: true },
+        { id: 'negociacao', fase: '4.3', nome: 'Negociação', responsavel: 'Compras', de: 'propostas', ate: 'negociado', porRequisicao: true },
+        { id: 'emissao_po', fase: '4.4', nome: 'Emissão do pedido', responsavel: 'Compras', de: 'negociado', ate: 'po_criado' },
+        { id: 'aprovacao_po', fase: '4.5', nome: 'Aprovação do pedido', responsavel: 'Head de Compras', de: 'po_criado', ate: 'po_aprovado' },
+        { id: 'entrega', fase: '4.6 a 4.8', nome: 'Entrega e recebimento', responsavel: 'Fornecedor / Compras / Logística', de: 'po_aprovado', ate: 'recebido' },
+        { id: 'lancamento', fase: '4.9', nome: 'Lançamento da NF', responsavel: 'Fiscal / Contas a pagar', de: 'recebido', ate: 'nf_lancada' },
+        { id: 'pagamento', fase: '4.9', nome: 'Pagamento', responsavel: 'Financeiro', de: 'nf_lancada', ate: 'pago' }
     ]
 
-    // Dias uteis por etapa. Pagamento = tolerancia apos o vencimento.
-    const SLA_PADRAO = { aprovacao_req: 2, emissao_po: 3, aprovacao_po: 2, entrega: 15, lancamento: 3, pagamento: 0 }
+    // Dias uteis por etapa. Pagamento = tolerancia apos o vencimento. O manual nao
+    // fixa prazo: as metas sao ponto de partida, ajustaveis na configuracao.
+    const SLA_PADRAO = { aprovacao_req: 2, bid: 2, propostas: 3, negociacao: 3, emissao_po: 3, aprovacao_po: 2, entrega: 15, lancamento: 3, pagamento: 0 }
+
+    // Manual, item 7.1 (2): no minimo 3 cotacoes de mercado.
+    const MINIMO_COTACOES = 3
 
     // Texto do status vem no idioma da conta: casar pelos dois.
     const RE_APROVACAO_PENDENTE = /aprova[cç][aã]o.*pendente|pending.*approval/i
@@ -191,8 +209,33 @@ define([], () => {
     }
 
     /**
+     * Fases 4.2 e 4.3 de uma requisicao a partir dos Bids dela. Vale para todos
+     * os pedidos da requisicao. temPedido: Compras ja emitiu pedido.
+     */
+    function analisarBid(bids, convidados, rodadas, temPedido) {
+        const enviados = bids.filter((b) => b.envio)
+        if (!enviados.length) return { bid: bids[0] || null, convites: null, propostas: null, negociado: null, cotacao: { convidados: 0, propostas: 0, rodadas: 0, minimoAtendido: false } }
+        const respostas = convidados.map((c) => c.respondido).filter(Boolean)
+        const negociacao = rodadas.filter((r) => Number(r.rodada) >= 2)
+        const seguiu = temPedido || negociacao.length > 0
+        const todosResponderam = convidados.length > 0 && respostas.length === convidados.length
+        return {
+            bid: enviados.slice().sort((x, y) => String(x.envio).localeCompare(String(y.envio)))[0],
+            convites: menor(enviados.map((b) => b.envio)),
+            propostas: respostas.length && (todosResponderam || seguiu) ? maior(respostas) : null,
+            negociado: temPedido ? maior(negociacao.map((r) => r.data)) : null,
+            cotacao: {
+                convidados: convidados.length,
+                propostas: respostas.length,
+                rodadas: rodadas.reduce((m, r) => Math.max(m, Number(r.rodada) || 0), 0),
+                minimoAtendido: respostas.length >= MINIMO_COTACOES
+            }
+        }
+    }
+
+    /**
      * Monta os ciclos a partir das linhas lidas.
-     * dados = { reqs, reqNotas, pos, poNotas, recebimentos, contas, pagamentos }
+     * dados = { reqs, reqNotas, bids, convidados, rodadas, pos, poNotas, recebimentos, contas, pagamentos }
      */
     function montarCiclos(dados, config, hoje) {
         const feriados = new Set(config.feriados)
@@ -202,14 +245,25 @@ define([], () => {
         const recDoPo = agrupar(dados.recebimentos, 'po_id')
         const contasDoPo = agrupar(dados.contas, 'po_id')
         const pagDaConta = agrupar(dados.pagamentos, 'conta_id')
+        const bidsDaReq = agrupar(dados.bids, 'req_id')
+        const convDoBid = agrupar(dados.convidados, 'bid_id')
+        const rodDoBid = agrupar(dados.rodadas, 'bid_id')
 
         const ciclos = []
         for (const req of dados.reqs || []) {
             const sla = slaPara(config, req.depto_id, req.prioridade_id)
             const aprovReq = analisarAprovacao(notasReq.get(String(req.id)), req.criada)
             const pos = posDaReq.get(String(req.id)) || [null]
+            const bids = bidsDaReq.get(String(req.id)) || []
+            const doBid = (m) => [].concat.apply([], bids.map((b) => m.get(String(b.id)) || []))
+            const fonte = analisarBid(bids, doBid(convDoBid), doBid(rodDoBid), Boolean(pos[0]))
+            // Sem Bid, ou Bid nunca enviado com pedido ja emitido: a compra nao passou por cotacao.
+            const semBid = !fonte.convites && (!bids.length || Boolean(pos[0]))
             pos.forEach((po, i) => {
-                const marcos = { req_criada: req.criada, req_aprovada: null, po_criado: null, po_aprovado: null, recebido: null, nf_lancada: null, pago: null }
+                const marcos = {
+                    req_criada: req.criada, req_aprovada: null, convites_enviados: fonte.convites, propostas: fonte.propostas, negociado: fonte.negociado,
+                    po_criado: null, po_aprovado: null, recebido: null, nf_lancada: null, pago: null
+                }
                 if (aprovReq.situacao === 'aprovada' || aprovReq.situacao === 'automatica') marcos.req_aprovada = aprovReq.quando
 
                 let aprovPo = null
@@ -245,9 +299,31 @@ define([], () => {
                 etapas.aprovacao_req.reaprovacoes = aprovReq.reaprovacoes
 
                 const reqParada = !po && (String(req.status) === STATUS.reqFechada || String(req.status) === STATUS.reqRejeitada)
+                const encerrada = (id) => ({ situacao: 'encerrada', dias: null, sla: sla[id] })
+                let inicioEmissao
+                if (semBid) {
+                    ['bid', 'propostas', 'negociacao'].forEach((id) => { etapas[id] = { situacao: 'sem_bid', dias: null, sla: sla[id] } })
+                    inicioEmissao = marcos.req_aprovada
+                } else {
+                    etapas.bid = medirEtapa(marcos.req_aprovada, marcos.convites_enviados, sla.bid, hoje, feriados)
+                    // Ninguem respondeu e o pedido saiu assim mesmo: a fase acabou sem proposta.
+                    etapas.propostas = po && !marcos.propostas
+                        ? encerrada('propostas')
+                        : medirEtapa(marcos.convites_enviados, marcos.propostas, sla.propostas, hoje, feriados)
+                    etapas.negociacao = po && !marcos.negociado
+                        ? { situacao: 'nao_se_aplica', dias: null, sla: sla.negociacao }
+                        : medirEtapa(marcos.propostas, marcos.negociado, sla.negociacao, hoje, feriados)
+                    // Sem pedido a negociacao segue aberta e a emissao nao comecou.
+                    inicioEmissao = po ? marcos.negociado || marcos.propostas || marcos.convites_enviados : null
+                    if (reqParada) {
+                        ['bid', 'propostas', 'negociacao'].forEach((id) => {
+                            if (['no_prazo', 'fora_prazo'].indexOf(etapas[id].situacao) < 0) etapas[id] = encerrada(id)
+                        })
+                    }
+                }
                 etapas.emissao_po = reqParada
-                    ? { situacao: 'encerrada', dias: null, sla: sla.emissao_po }
-                    : medirEtapa(marcos.req_aprovada, marcos.po_criado, sla.emissao_po, hoje, feriados)
+                    ? encerrada('emissao_po')
+                    : medirEtapa(inicioEmissao, marcos.po_criado, sla.emissao_po, hoje, feriados)
 
                 if (aprovPo && aprovPo.situacao === 'rejeitada') {
                     etapas.aprovacao_po = { situacao: 'rejeitada', dias: diasUteis(po.criado, aprovPo.quando, feriados), sla: sla.aprovacao_po }
@@ -283,6 +359,10 @@ define([], () => {
                     : null
 
                 const concluidas = ordem.filter((id) => ['no_prazo', 'fora_prazo'].indexOf(etapas[id].situacao) >= 0)
+                // Manual 4.9: pagamento so depois do recebimento registrado.
+                const primeiroPagamento = menor(contas.map((c) => c.pago))
+                const pagoAntesDoRecebimento = Boolean(primeiroPagamento) && Boolean(marcos.recebido) &&
+                    String(primeiroPagamento).slice(0, 10) < String(marcos.recebido).slice(0, 10)
                 ciclos.push({
                     chave: req.id + '-' + (po ? po.id : '0'),
                     primeiroDaReq: i === 0,
@@ -296,6 +376,9 @@ define([], () => {
                         id: po.id, tranid: po.tranid, criado: po.criado, status: po.status, statusNome: po.status_nome,
                         fornecedor: po.fornecedor, comprador: po.comprador, total: Number(po.total) || 0
                     } : null,
+                    bid: semBid || !fonte.bid ? null : { id: fonte.bid.id, nome: fonte.bid.name, rectype: fonte.bid.rectype || null },
+                    cotacao: fonte.cotacao,
+                    pagoAntesDoRecebimento,
                     recebimentos: recebimentos.map((r) => ({ id: r.id, tranid: r.tranid, data: r.data })),
                     contas: etapas.pagamento.contas || [],
                     marcos, etapas, servico, situacao, etapaAtual,
@@ -331,9 +414,11 @@ define([], () => {
         return { n: v.length, media: r(v.reduce((s, x) => s + x, 0) / v.length), mediana: r(pos(0.5)), p90: r(pos(0.9)), max: r(v[v.length - 1]) }
     }
 
-    // Aprovacao da requisicao conta uma vez por requisicao, nao por pedido.
+    // Etapas da requisicao (aprovacao, Bid, propostas, negociacao) contam uma vez
+    // por requisicao, nao uma vez por pedido.
+    const POR_REQUISICAO = new Set(ETAPAS.filter((e) => e.porRequisicao).map((e) => e.id))
     function ciclosDaEtapa(ciclos, etapaId) {
-        return etapaId === 'aprovacao_req' ? ciclos.filter((c) => c.primeiroDaReq) : ciclos
+        return POR_REQUISICAO.has(etapaId) ? ciclos.filter((c) => c.primeiroDaReq) : ciclos
     }
 
     function resumoEtapa(ciclos, etapaId) {
@@ -376,7 +461,7 @@ define([], () => {
         const todasEtapas = []
         for (const c of ciclos) {
             for (const e of ETAPAS) {
-                if (e.id === 'aprovacao_req' && !c.primeiroDaReq) continue
+                if (POR_REQUISICAO.has(e.id) && !c.primeiroDaReq) continue
                 todasEtapas.push(c.etapas[e.id])
             }
         }
@@ -430,6 +515,7 @@ define([], () => {
             atrasadas: andamento.filter((c) => c.etapaAtual === e.id && c.etapas[e.id].situacao === 'atrasada').length
         }))
 
+        const primeiros = ciclos.filter((c) => c.primeiroDaReq)
         const fornecedores = ranking(ciclos.filter((c) => c.po), 'entrega', (c) => c.po.fornecedor)
         return {
             kpis: {
@@ -449,7 +535,13 @@ define([], () => {
                 valorPedidos: ciclos.reduce((s, c) => s + (c.po ? c.po.total : 0), 0),
                 contasSemBaixa: ciclos.reduce((s, c) => s + (c.etapas.pagamento.semBaixa || 0), 0),
                 contasPagas: ciclos.reduce((s, c) => s + c.contas.filter((x) => x.pago).length, 0),
-                contas: ciclos.reduce((s, c) => s + c.contas.length, 0)
+                contas: ciclos.reduce((s, c) => s + c.contas.length, 0),
+                reqComPedido: primeiros.filter((c) => c.po).length,
+                reqComBid: primeiros.filter((c) => c.etapas.bid.situacao !== 'sem_bid').length,
+                reqMinimoCotacoes: primeiros.filter((c) => c.cotacao.minimoAtendido).length,
+                pedidosSemBid: primeiros.filter((c) => c.po && c.etapas.bid.situacao === 'sem_bid').length,
+                pagoAntesDoRecebimento: ciclos.filter((c) => c.pagoAntesDoRecebimento).length,
+                minimoCotacoes: MINIMO_COTACOES
             },
             porEtapa, porDepto, mensal, histograma, etapaAtual,
             rankings: {
@@ -462,7 +554,7 @@ define([], () => {
     }
 
     return {
-        ETAPAS, SLA_PADRAO, STATUS,
+        ETAPAS, SLA_PADRAO, STATUS, MINIMO_COTACOES,
         diasUteis, diasCorridos, lerConfig, slaPara, analisarAprovacao,
         medirEtapa, medirPagamento, montarCiclos, filtrar, estatistica, agregar
     }

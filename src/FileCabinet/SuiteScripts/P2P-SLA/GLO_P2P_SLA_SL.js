@@ -1,9 +1,11 @@
 /**
  * GLO_P2P_SLA_SL.js
  *
- * Painel gerencial de SLA do procure-to-pay: Requisicao -> aprovacao ->
- * Pedido de compra -> aprovacao -> Recebimento -> Conta a pagar -> Pagamento,
- * por departamento, prioridade, aprovador, comprador e fornecedor.
+ * Painel gerencial de SLA do procure-to-pay nas fases do Manual de
+ * Procedimentos de Compras MPI-SUP-001 (item 4): Requisicao -> aprovacao ->
+ * Bid e convites -> propostas -> negociacao -> Pedido de compra -> aprovacao ->
+ * Recebimento -> Conta a pagar -> Pagamento, por departamento, prioridade,
+ * aprovador, comprador e fornecedor.
  *
  *   GET                 pagina (HTML + Chart.js)
  *   GET action=dados    JSON: ciclos e agregados do periodo/filtros
@@ -12,13 +14,18 @@
  * em GLO_P2P_SLA_Lib.js, testada em __tests__.
  *
  * Datas: abertura = createddate (o trandate pode ser retroativo); aprovacao =
- * systemnote TRANDOC.KSTATUS; recebimento e pagamento = trandate.
+ * systemnote TRANDOC.KSTATUS; recebimento e pagamento = trandate. Bid,
+ * propostas e rodadas vem dos registros do projeto P2P - Req
+ * (customrecord_gl_bid, _bid_forn, _bid_neg_rodada). Conta sem esse projeto
+ * (sandbox, por exemplo): a leitura do Bid falha, o painel segue sem as fases
+ * 4.2 e 4.3 e avisa.
  *
  * Pagamento: so existe quando ha Bill Payment aplicado a conta a pagar. Conta
  * aberta com vencimento passado aparece como "sem baixa", nunca como paga.
  *
  * Orcamento de governanca (Suitelet = 1.000 unidades), action=dados:
- *   requisicoes 10 + notas da requisicao 10 + pedidos 10
+ *   requisicoes 10 + notas da requisicao 10 + pedidos 10 + Bids 10
+ *   + por lote de ate 900 Bids: convidados 10, rodadas 10
  *   + por lote de ate 900 pedidos: notas 10, recebimentos 10, contas 10
  *   + por lote de ate 900 contas: pagamentos 10
  *   + 5 por pagina extra de 1.000 linhas. Um ano de dados (~700 ciclos) fica em ~80.
@@ -67,7 +74,17 @@ define(['N/query', 'N/runtime', 'N/log', './GLO_P2P_SLA_Lib'], (query, runtime, 
             "WHERE l.linktype IN ('OrdBill', 'ShipRcpt') AND l.previousdoc IN (#IDS#)",
         pagamentos: 'SELECT DISTINCT l.previousdoc conta_id, p.id, p.tranid, TO_CHAR(p.trandate, ' + F_DIA + ') data ' +
             "FROM previoustransactionlink l JOIN transaction p ON p.id = l.nextdoc AND p.type = 'VendPymt' " +
-            "WHERE l.linktype = 'Payment' AND l.previousdoc IN (#IDS#)"
+            "WHERE l.linktype = 'Payment' AND l.previousdoc IN (#IDS#)",
+        // rectype: id interno do tipo de registro, que varia por conta (link do Bid na tabela).
+        bids: 'SELECT b.id, b.name, b.custrecord_gl_bid_requisicao req_id, TO_CHAR(b.created, ' + F_HORA + ') criado, ' +
+            'TO_CHAR(b.custrecord_gl_bid_dt_envio, ' + F_HORA + ') envio, ' +
+            "(SELECT ct.internalid FROM customrecordtype ct WHERE ct.scriptid = 'CUSTOMRECORD_GL_BID') rectype " +
+            "FROM customrecord_gl_bid b WHERE b.isinactive = 'F' AND b.custrecord_gl_bid_requisicao IN (" + SQL_REQS_ID + ')',
+        convidados: 'SELECT f.custrecord_gl_bidforn_bid bid_id, f.id, TO_CHAR(f.custrecord_gl_bidforn_dt_resp, ' + F_HORA + ') respondido ' +
+            "FROM customrecord_gl_bid_forn f WHERE f.isinactive = 'F' AND f.custrecord_gl_bidforn_bid IN (#IDS#)",
+        rodadas: 'SELECT r.custrecord_gl_neg_bid bid_id, r.custrecord_gl_neg_cotacao cot_id, r.custrecord_gl_neg_rodada rodada, ' +
+            'TO_CHAR(r.custrecord_gl_neg_data, ' + F_HORA + ') data ' +
+            "FROM customrecord_gl_bid_neg_rodada r WHERE r.isinactive = 'F' AND r.custrecord_gl_neg_bid IN (#IDS#)"
     }
 
     function semGovernanca() {
@@ -126,16 +143,33 @@ define(['N/query', 'N/runtime', 'N/log', './GLO_P2P_SLA_Lib'], (query, runtime, 
         const reqs = ler(SQL.reqs, periodo, estado)
         const reqNotas = ler(SQL.reqNotas, periodo, estado)
         const pos = ler(SQL.pos, periodo, estado)
+        let bids = []
+        let convidados = []
+        let rodadas = []
+        let semProjetoBid = null
+        try {
+            bids = ler(SQL.bids, periodo, estado)
+            const bidIds = bids.map((b) => b.id)
+            convidados = lerEmLotes(SQL.convidados, bidIds, estado)
+            rodadas = lerEmLotes(SQL.rodadas, bidIds, estado)
+        } catch (e) {
+            semProjetoBid = e.message
+            bids = []
+            convidados = []
+            rodadas = []
+            log.audit('p2p-sla sem Bid', e.message)
+        }
         const poIds = pos.map((p) => p.id)
         const poNotas = lerEmLotes(SQL.poNotas, poIds, estado)
         const recebimentos = lerEmLotes(SQL.recebimentos, poIds, estado)
         const contas = lerEmLotes(SQL.contas, poIds, estado)
         const pagamentos = lerEmLotes(SQL.pagamentos, contas.map((c) => c.id), estado)
 
-        const todos = lib.montarCiclos({ reqs, reqNotas, pos, poNotas, recebimentos, contas, pagamentos }, config, hojeIso())
+        const todos = lib.montarCiclos({ reqs, reqNotas, bids, convidados, rodadas, pos, poNotas, recebimentos, contas, pagamentos }, config, hojeIso())
         const ciclos = lib.filtrar(todos, { depto: params.depto, sub: params.sub, prioridade: params.prioridade, situacao: params.situacao })
         const avisos = []
         if (config.erro) avisos.push(config.erro + ' Usando o SLA padrão.')
+        if (semProjetoBid) avisos.push('Registros de Bid (projeto P2P - Req) não encontrados nesta conta: as fases 4.2 e 4.3 aparecem como "sem Bid". ' + semProjetoBid)
         if (estado.truncado) avisos.push('Leitura interrompida por limite de governança: reduza o período. Os números abaixo estão incompletos.')
         const agregados = lib.agregar(ciclos)
         if (agregados.kpis.contasSemBaixa > 0) {
@@ -204,8 +238,7 @@ section .sub{color:var(--mute);font-size:12.5px;margin:0 0 12px}
 .grid2>section{margin-bottom:0}
 .linha{margin-bottom:16px}
 @media(max-width:1100px){.grid2{grid-template-columns:1fr}}
-.fluxo{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
-@media(max-width:1300px){.fluxo{grid-template-columns:repeat(3,1fr)}}
+.fluxo{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px}
 @media(max-width:700px){.fluxo{grid-template-columns:1fr}}
 .etapa{border:1px solid var(--line);border-radius:10px;padding:12px;position:relative;cursor:pointer;transition:box-shadow .15s}
 .etapa:hover{box-shadow:0 4px 14px rgba(16,24,40,.1)}
@@ -223,6 +256,7 @@ section .sub{color:var(--mute);font-size:12.5px;margin:0 0 12px}
 .t-fora_prazo,.t-atrasada,.t-rejeitada,.t-rejeitado{background:var(--badbg);color:#b42318}
 .t-andamento{background:var(--warnbg);color:#b54708}
 .t-pendente,.t-nao_se_aplica,.t-encerrada,.t-encerrado{background:var(--nabg);color:#475467}
+.t-sem_bid{background:#fef0c7;color:#93370d}
 .canvas{position:relative;height:340px}
 .canvas.alto{height:420px}
 table{border-collapse:collapse;width:100%;font-size:12.5px}
@@ -258,7 +292,7 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
 <body>
 <header>
   <h1>SLA Procure-to-Pay</h1>
-  <p>Requisição &rarr; Aprovação &rarr; Pedido de compra &rarr; Aprovação &rarr; Recebimento &rarr; Lançamento da NF &rarr; Pagamento &middot; prazos em dias úteis</p>
+  <p>Fases do Manual de Procedimentos de Compras (MPI-SUP-001, item 4): Requisição &rarr; Aprovação &rarr; Bid e convites &rarr; Propostas &rarr; Negociação &rarr; Pedido de compra &rarr; Aprovação &rarr; Entrega e recebimento &rarr; Lançamento da NF &rarr; Pagamento &middot; prazos em dias úteis</p>
   <div class="filtros">
     <label>De<input type="date" id="f-de"></label>
     <label>Até<input type="date" id="f-ate"></label>
@@ -343,7 +377,7 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
       <select id="f-etapa-sit"><option value="">Qualquer situação</option><option value="atrasada">Atrasada agora</option><option value="fora_prazo">Concluída fora do prazo</option><option value="andamento">Em andamento no prazo</option><option value="no_prazo">Concluída no prazo</option></select>
       <span id="contagem" style="color:var(--mute);font-size:12.5px"></span>
     </div>
-    <div class="legenda"><span class="tag t-no_prazo">no prazo</span><span class="tag t-fora_prazo">fora do prazo / atrasada</span><span class="tag t-andamento">em andamento</span><span class="tag t-pendente">pendente / não se aplica</span></div>
+    <div class="legenda"><span class="tag t-no_prazo">no prazo</span><span class="tag t-fora_prazo">fora do prazo / atrasada</span><span class="tag t-andamento">em andamento</span><span class="tag t-pendente">pendente / não se aplica</span><span class="tag t-sem_bid">sem Bid (sem cotação)</span></div>
     <div class="tabela" style="margin-top:8px"><table id="detalhe"></table></div>
     <div class="pag" id="pag"></div>
   </section>
@@ -353,7 +387,7 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
   <h2 style="margin-top:0">Metas de SLA (dias úteis)</h2>
   <div id="sla-corpo"></div>
   <p class="sub" style="margin-top:12px">As metas ficam no parâmetro <b>Configuração de SLA</b> do deployment do Suitelet, em JSON. A meta de departamento vence a de prioridade, que vence a geral. Exemplo:</p>
-  <pre>{"etapas":{"aprovacao_req":2,"emissao_po":3,"aprovacao_po":2,"entrega":15,"lancamento":3,"pagamento":0},
+  <pre>{"etapas":{"aprovacao_req":2,"bid":2,"propostas":3,"negociacao":3,"emissao_po":3,"aprovacao_po":2,"entrega":15,"lancamento":3,"pagamento":0},
  "prioridade":{"1":{"emissao_po":1,"aprovacao_req":1}},
  "departamento":{"38":{"entrega":10}},
  "feriados":["2026-11-02","2026-11-15","2026-11-20","2026-12-25"]}</pre>
@@ -364,11 +398,14 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
 (function () {
   'use strict';
   var CORES = ['#2f80ed', '#12b76a', '#f79009', '#7a5af8', '#ee46bc', '#06aed4', '#f04438', '#667085', '#15b79e', '#875bf7', '#fb6514', '#2e90fa', '#a15c07', '#4e5ba6'];
-  var COR_ETAPA = { aprovacao_req: '#7a5af8', emissao_po: '#2f80ed', aprovacao_po: '#06aed4', entrega: '#f79009', lancamento: '#15b79e', pagamento: '#ee46bc' };
-  var COR_SIT = { no_prazo: ['#e8f8f0', '#067647'], concluido: ['#e8f8f0', '#067647'], fora_prazo: ['#fdecea', '#b42318'], atrasada: ['#fdecea', '#b42318'], rejeitada: ['#fdecea', '#b42318'], andamento: ['#fef4e6', '#b54708'], pendente: ['#f2f4f7', '#98a2b3'], nao_se_aplica: ['#f2f4f7', '#98a2b3'], encerrada: ['#f2f4f7', '#98a2b3'] };
-  var NOME_SIT = { no_prazo: 'No prazo', fora_prazo: 'Fora do prazo', atrasada: 'Atrasada', andamento: 'Em andamento', pendente: 'Pendente', nao_se_aplica: 'Não se aplica', encerrada: 'Encerrada', rejeitada: 'Rejeitada', concluido: 'Concluído', rejeitado: 'Rejeitado', encerrado: 'Encerrado' };
+  var COR_ETAPA = { aprovacao_req: '#7a5af8', bid: '#875bf7', propostas: '#fb6514', negociacao: '#a15c07', emissao_po: '#2f80ed', aprovacao_po: '#06aed4', entrega: '#f79009', lancamento: '#15b79e', pagamento: '#ee46bc' };
+  var COR_SIT = { no_prazo: ['#e8f8f0', '#067647'], concluido: ['#e8f8f0', '#067647'], fora_prazo: ['#fdecea', '#b42318'], atrasada: ['#fdecea', '#b42318'], rejeitada: ['#fdecea', '#b42318'], andamento: ['#fef4e6', '#b54708'], pendente: ['#f2f4f7', '#98a2b3'], nao_se_aplica: ['#f2f4f7', '#98a2b3'], encerrada: ['#f2f4f7', '#98a2b3'], sem_bid: ['#fef0c7', '#93370d'] };
+  var NOME_SIT = { no_prazo: 'No prazo', fora_prazo: 'Fora do prazo', atrasada: 'Atrasada', andamento: 'Em andamento', pendente: 'Pendente', nao_se_aplica: 'Não se aplica', encerrada: 'Encerrada', rejeitada: 'Rejeitada', concluido: 'Concluído', rejeitado: 'Rejeitado', encerrado: 'Encerrado', sem_bid: 'Sem Bid' };
   var LINK = { req: '/app/accounting/transactions/purchreq.nl?id=', po: '/app/accounting/transactions/purchord.nl?id=', rec: '/app/accounting/transactions/itemrcpt.nl?id=', conta: '/app/accounting/transactions/vendbill.nl?id=', pag: '/app/accounting/transactions/vendpymt.nl?id=' };
   var POR_PAGINA = 50;
+  function linkBid(b) {
+    return b && b.rectype ? '<a href="/app/common/custom/custrecordentry.nl?rectype=' + encodeURIComponent(b.rectype) + '&id=' + encodeURIComponent(b.id) + '" target="_blank">' + esc(b.nome || b.id) + '</a>' : esc(b ? b.nome : '');
+  }
   var estado = { dados: null, graficos: {}, pagina: 1, etapaSel: '' };
 
   var $ = function (id) { return document.getElementById(id); };
@@ -465,7 +502,10 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
       kpi('Etapas no prazo', pct(k.pctEtapasNoPrazo), k.etapasConcluidas + ' etapas concluídas', cls),
       kpi('Atrasadas agora', num(k.atrasadasAgora), k.andamento + ' processos em andamento', k.atrasadasAgora ? 'bad' : 'ok'),
       kpi('Valor em pedidos', moeda.format(k.valorPedidos || 0), k.rejeitados + ' rejeitados · ' + k.encerrados + ' encerrados'),
-      kpi('Contas a pagar', num(k.contas), k.contasPagas + ' com pagamento registrado · ' + k.contasSemBaixa + ' vencidas sem baixa', k.contasSemBaixa ? 'warn' : '')
+      kpi('Contas a pagar', num(k.contas), k.contasPagas + ' com pagamento registrado · ' + k.contasSemBaixa + ' vencidas sem baixa', k.contasSemBaixa ? 'warn' : ''),
+      kpi('Mínimo de ' + k.minimoCotacoes + ' cotações', num(k.reqMinimoCotacoes) + ' <small style="font-size:13px">de ' + num(k.reqComBid) + ' com Bid</small>',
+        k.pedidosSemBid + ' requisições com pedido sem Bid (manual 4.2)', k.pedidosSemBid || k.reqMinimoCotacoes < k.reqComBid ? 'warn' : 'ok'),
+      kpi('Pago antes do recebimento', num(k.pagoAntesDoRecebimento), 'manual 4.9: pagamento só após o recebimento', k.pagoAntesDoRecebimento ? 'bad' : 'ok')
     ].join('');
   }
 
@@ -476,7 +516,7 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
         ? num(e.mediana) + ' <small>d.u. após venc.</small>'
         : num(e.mediana) + ' <small>d.u. (meta ' + num(d.sla[e.id]) + ')</small>';
       return '<div class="etapa' + (estado.etapaSel === e.id ? ' sel' : '') + '" data-etapa="' + e.id + '" style="border-top:4px solid ' + COR_ETAPA[e.id] + '">' +
-        '<div class="n">ETAPA ' + (i + 1) + '</div><h3>' + esc(e.nome) + '</h3><div class="resp">' + esc(e.responsavel) + '</div>' +
+        '<div class="n">' + (i + 1) + ' · Fase ' + esc(e.fase) + '</div><h3>' + esc(e.nome) + '</h3><div class="resp">' + esc(e.responsavel) + '</div>' +
         '<div class="big">' + medida + '</div>' +
         '<div class="barra"><i style="width:' + p + '%"></i></div>' +
         '<div class="det"><span><b>' + pct(e.pctNoPrazo) + '</b> no prazo (' + e.noPrazo + '/' + e.concluidas + ')</span></div>' +
@@ -635,17 +675,17 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
     var sit = $('f-etapa-sit').value;
     return estado.dados.ciclos.filter(function (c) {
       if (etapa && sit && c.etapas[etapa].situacao !== sit) return false;
-      if (etapa && !sit && ['pendente', 'nao_se_aplica'].indexOf(c.etapas[etapa].situacao) >= 0) return false;
+      if (etapa && !sit && ['pendente', 'nao_se_aplica', 'sem_bid'].indexOf(c.etapas[etapa].situacao) >= 0) return false;
       if (!etapa && sit && !Object.keys(c.etapas).some(function (k) { return c.etapas[k].situacao === sit; })) return false;
       if (!termo) return true;
-      var alvo = [c.req.tranid, c.req.solicitante, c.req.depto, c.req.memo, c.po && c.po.tranid, c.po && c.po.fornecedor, c.po && c.po.comprador].join(' ').toLowerCase();
+      var alvo = [c.req.tranid, c.req.solicitante, c.req.depto, c.req.memo, c.bid && c.bid.nome, c.po && c.po.tranid, c.po && c.po.fornecedor, c.po && c.po.comprador].join(' ').toLowerCase();
       return alvo.indexOf(termo) >= 0;
     });
   }
 
   function chip(e, id) {
     var c = COR_SIT[e.situacao] || COR_SIT.pendente;
-    var valor = e.situacao === 'pendente' || e.situacao === 'nao_se_aplica' || e.situacao === 'encerrada' ? '·' : (id === 'pagamento' && e.atrasoMaximo != null ? (e.atrasoMaximo > 0 ? '+' : '') + nf.format(e.atrasoMaximo) : nf.format(e.dias || 0));
+    var valor = ['pendente', 'nao_se_aplica', 'encerrada', 'sem_bid'].indexOf(e.situacao) >= 0 ? '·' : (id === 'pagamento' && e.atrasoMaximo != null ? (e.atrasoMaximo > 0 ? '+' : '') + nf.format(e.atrasoMaximo) : nf.format(e.dias || 0));
     var dica = nomeEtapa(id) + ': ' + (NOME_SIT[e.situacao] || e.situacao) + (e.dias != null ? ' · ' + nf.format(e.dias) + ' d.u.' : '') + ' · meta ' + e.sla + (e.automatica ? ' · aprovação automática' : '') + (e.quem ? ' · ' + e.quem : '');
     return '<span class="chip" title="' + esc(dica) + '" style="background:' + c[0] + ';color:' + c[1] + '">' + valor + '</span>';
   }
@@ -657,9 +697,9 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
     if (estado.pagina > paginas) estado.pagina = paginas;
     var pagina = lista.slice((estado.pagina - 1) * POR_PAGINA, estado.pagina * POR_PAGINA);
     $('contagem').textContent = lista.length + ' de ' + estado.dados.ciclos.length + ' linhas';
-    var cab = '<thead><tr><th>Requisição</th><th>Departamento</th><th>Solicitante</th><th>Prioridade</th><th>Abertura req.</th><th>Aprovação req.</th>' +
+    var cab = '<thead><tr><th>Requisição</th><th>Departamento</th><th>Solicitante</th><th>Prioridade</th><th>Abertura req.</th><th>Aprovação req.</th><th>Bid</th>' +
       '<th>Pedido</th><th>Abertura PO</th><th>Aprovação PO</th><th>Fornecedor</th><th>Recebimento</th><th>NF lançada</th><th>Vencimento</th><th>Pagamento</th>' +
-      '<th title="Aprov. req · Emissão PO · Aprov. PO · Entrega · Lançamento · Pagamento (dias após o vencimento)">Dias úteis por etapa</th><th class="num">Lead time</th><th class="num">Valor PO</th><th>Situação</th></tr></thead>';
+      '<th title="' + esc(estado.dados.etapas.map(function (e) { return e.nome; }).join(' · ')) + ' (pagamento: dias após o vencimento)">Dias úteis por etapa</th><th class="num">Lead time</th><th class="num">Valor PO</th><th>Situação</th></tr></thead>';
     var corpo = pagina.map(function (c) {
       var m = c.marcos;
       var contas = c.contas || [];
@@ -670,6 +710,7 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
         '<td>' + esc(c.req.depto) + '</td><td>' + esc(c.req.solicitante) + '</td><td>' + esc(c.req.prioridade) + '</td>' +
         '<td>' + dataHoraBr(m.req_criada) + '</td>' +
         '<td>' + (c.etapas.aprovacao_req.automatica ? '<span style="color:#98a2b3">automática</span>' : dataHoraBr(m.req_aprovada)) + '</td>' +
+        '<td>' + (c.bid ? linkBid(c.bid) + '<br><small style="color:' + (c.cotacao.minimoAtendido ? '#667085' : '#b42318') + '">' + c.cotacao.propostas + '/' + c.cotacao.convidados + ' propostas · ' + c.cotacao.rodadas + ' rodada(s)</small>' : tag('sem_bid')) + '</td>' +
         '<td>' + (c.po ? link('po', c.po.id, c.po.tranid) : '') + '</td>' +
         '<td>' + dataHoraBr(m.po_criado) + '</td>' +
         '<td>' + (c.etapas.aprovacao_po.automatica ? '<span style="color:#98a2b3">automática</span>' : dataHoraBr(m.po_aprovado)) + '</td>' +
@@ -677,14 +718,14 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
         '<td>' + (c.servico ? '<span style="color:#98a2b3">serviço</span>' : (c.recebimentos || []).slice(0, 1).map(function (r) { return link('rec', r.id, dataBr(r.data)); }).join('')) + '</td>' +
         '<td>' + contas.slice(0, 2).map(function (x) { return link('conta', x.id, dataHoraBr(x.criada)); }).join('<br>') + '</td>' +
         '<td>' + contas.slice(0, 2).map(function (x) { return dataBr(x.vencimento); }).join('<br>') + '</td>' +
-        '<td>' + (pagos.length ? pagos.slice(0, 2).join('<br>') : (contas.length ? '<span style="color:#b42318">sem baixa</span>' : '')) + '</td>' +
+        '<td>' + (pagos.length ? pagos.slice(0, 2).join('<br>') : (contas.length ? '<span style="color:#b42318">sem baixa</span>' : '')) + (c.pagoAntesDoRecebimento ? '<br><small style="color:#b42318">antes do recebimento</small>' : '') + '</td>' +
         '<td><div class="chips">' + estado.dados.etapas.map(function (e) { return chip(c.etapas[e.id], e.id); }).join('') + '</div></td>' +
         '<td class="num">' + (c.leadUteis != null ? num(c.leadUteis) : '<span style="color:#98a2b3">' + num(c.idadeUteis) + '</span>') + '</td>' +
         '<td class="num">' + (c.po ? moeda.format(c.po.total) : '') + '</td>' +
         '<td>' + tag(c.situacao) + (c.etapaAtual ? '<br><small style="color:#667085">' + esc(nomeEtapa(c.etapaAtual)) + '</small>' : '') + '</td>' +
         '</tr>';
     }).join('');
-    $('detalhe').innerHTML = cab + '<tbody>' + (corpo || '<tr><td colspan="18" style="color:#98a2b3;padding:18px">Nenhuma linha com esses filtros.</td></tr>') + '</tbody>';
+    $('detalhe').innerHTML = cab + '<tbody>' + (corpo || '<tr><td colspan="19" style="color:#98a2b3;padding:18px">Nenhuma linha com esses filtros.</td></tr>') + '</tbody>';
     $('pag').innerHTML = '<button id="pg-ant"' + (estado.pagina <= 1 ? ' disabled' : '') + '>&lsaquo; Anterior</button><span>Página ' + estado.pagina + ' de ' + paginas + '</span><button id="pg-prox"' + (estado.pagina >= paginas ? ' disabled' : '') + '>Próxima &rsaquo;</button>';
     $('pg-ant').onclick = function () { estado.pagina--; renderDetalhe(); };
     $('pg-prox').onclick = function () { estado.pagina++; renderDetalhe(); };
@@ -741,8 +782,9 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
   function linhasDetalhe() {
     var etapas = estado.dados.etapas;
     var cab = ['Requisição', 'Departamento', 'Solicitante', 'Prioridade', 'Subsidiária', 'Abertura requisição', 'Aprovação requisição', 'Aprovador requisição',
+      'Bid', 'Convites enviados', 'Fornecedores convidados', 'Propostas recebidas', 'Rodadas', 'Mínimo de cotações atendido',
       'Pedido', 'Abertura pedido', 'Aprovação pedido', 'Aprovador pedido', 'Comprador', 'Fornecedor', 'Recebimento', 'NF lançada', 'Vencimento', 'Pagamento',
-      'Valor pedido', 'Situação', 'Etapa atual', 'Lead time (d.u.)'];
+      'Pago antes do recebimento', 'Valor pedido', 'Situação', 'Etapa atual', 'Lead time (d.u.)'];
     etapas.forEach(function (e) { cab.push(e.nome + (e.id === 'pagamento' ? ' (d.u. após venc.)' : ' (d.u.)'), e.nome + ' – situação', e.nome + ' – meta'); });
     var linhas = ciclosVisiveis().map(function (c) {
       var m = c.marcos;
@@ -752,10 +794,11 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
       var aprovReq = c.etapas.aprovacao_req.automatica ? 'automática' : dataHoraBr(m.req_aprovada);
       var aprovPo = c.etapas.aprovacao_po.automatica ? 'automática' : dataHoraBr(m.po_aprovado);
       var l = ['#' + c.req.tranid, c.req.depto, c.req.solicitante || '', c.req.prioridade, c.req.subsidiaria || '', dataHoraBr(m.req_criada), aprovReq, c.etapas.aprovacao_req.quem || '',
+        c.bid ? c.bid.nome : 'sem Bid', dataHoraBr(m.convites_enviados), c.cotacao.convidados, c.cotacao.propostas, c.cotacao.rodadas, c.cotacao.minimoAtendido ? 'sim' : 'não',
         c.po ? c.po.tranid : '', dataHoraBr(m.po_criado), aprovPo, c.etapas.aprovacao_po.quem || '', c.po ? c.po.comprador || '' : '', c.po ? c.po.fornecedor || '' : '',
         c.servico ? 'serviço' : (c.recebimentos[0] ? dataBr(c.recebimentos[0].data) : ''), contas.map(function (x) { return dataHoraBr(x.criada); }).join(' | '),
         contas.map(function (x) { return dataBr(x.vencimento); }).join(' | '), pagos.length ? pagos.join(' | ') : (contas.length ? 'sem baixa' : ''),
-        c.po ? c.po.total : null, NOME_SIT[c.situacao] || c.situacao, c.etapaAtual ? nomeEtapa(c.etapaAtual) : '', c.leadUteis];
+        c.pagoAntesDoRecebimento ? 'sim' : '', c.po ? c.po.total : null, NOME_SIT[c.situacao] || c.situacao, c.etapaAtual ? nomeEtapa(c.etapaAtual) : '', c.leadUteis];
       etapas.forEach(function (e) {
         var x = c.etapas[e.id];
         var v = e.id === 'pagamento' ? x.atrasoMaximo : x.dias;
@@ -783,7 +826,9 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
       ['Em andamento', k.andamento], ['Rejeitados', k.rejeitados], ['Encerrados sem conclusão', k.encerrados],
       ['Lead time requisição → pagamento – mediana (d.u.)', k.leadMediana], ['Lead time – média (d.u.)', k.leadMedia], ['Lead time – P90 (d.u.)', k.leadP90],
       ['% de etapas concluídas no prazo', k.pctEtapasNoPrazo], ['Etapas concluídas', k.etapasConcluidas], ['Etapas atrasadas agora', k.atrasadasAgora],
-      ['Valor em pedidos (R$)', k.valorPedidos], ['Contas a pagar', k.contas], ['Contas com pagamento registrado', k.contasPagas], ['Contas vencidas sem baixa', k.contasSemBaixa]
+      ['Valor em pedidos (R$)', k.valorPedidos], ['Contas a pagar', k.contas], ['Contas com pagamento registrado', k.contasPagas], ['Contas vencidas sem baixa', k.contasSemBaixa],
+      ['Requisições com Bid (manual 4.2)', k.reqComBid], ['Requisições com no mínimo ' + k.minimoCotacoes + ' propostas', k.reqMinimoCotacoes],
+      ['Requisições com pedido sem Bid', k.pedidosSemBid], ['Pedidos pagos antes do recebimento (manual 4.9)', k.pagoAntesDoRecebimento]
     ];
   }
 
@@ -893,11 +938,11 @@ pre{background:#f8f9fb;padding:10px;border-radius:6px;overflow:auto;font-size:12
     cabecalho('Resumo');
     var k = d.agregados.kpis;
     var cartoes = [
-      ['Requisições', fmt(k.requisicoes), k.ciclos + ' pares req. × pedido'],
+      ['Requisições', fmt(k.requisicoes), k.reqMinimoCotacoes + '/' + k.reqComBid + ' Bids com ' + k.minimoCotacoes + ' cotações'],
       ['Lead time (mediana)', fmt(k.leadMediana, ' d.u.'), 'média ' + fmt(k.leadMedia) + ' · P90 ' + fmt(k.leadP90)],
       ['Etapas no prazo', fmt(k.pctEtapasNoPrazo, '%'), k.etapasConcluidas + ' concluídas'],
       ['Atrasadas agora', fmt(k.atrasadasAgora), k.andamento + ' em andamento'],
-      ['Valor em pedidos', moeda.format(k.valorPedidos || 0), k.rejeitados + ' rejeitados'],
+      ['Valor em pedidos', moeda.format(k.valorPedidos || 0), k.pagoAntesDoRecebimento + ' pagos antes do recebimento'],
       ['Contas a pagar', fmt(k.contas), k.contasSemBaixa + ' vencidas sem baixa']
     ];
     var wc = (L - 2 * M - 5 * 4) / 6;

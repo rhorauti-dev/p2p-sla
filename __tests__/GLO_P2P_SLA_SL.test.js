@@ -42,10 +42,16 @@ const LINHAS = {
     poNotas: [],
     recebimentos: [{ po_id: 11, id: 21, tranid: 'IR1', data: '2026-09-14' }],
     contas: [{ po_id: 11, id: 31, tranid: null, criada: '2026-09-15T09:00:00', vencimento: '2026-09-30', status: 'A', total: 1000 }],
-    pagamentos: []
+    pagamentos: [],
+    bids: [{ id: 1004, name: 'BID-1004', req_id: 1, criado: '2026-09-02T10:00:00', envio: '2026-09-02T11:00:00', rectype: 4583 }],
+    convidados: [{ bid_id: 1004, id: 5, respondido: '2026-09-02T15:00:00' }],
+    rodadas: []
 }
 
 function qualConsulta(sql) {
+    if (/customrecord_gl_bid_forn /.test(sql)) return 'convidados'
+    if (/customrecord_gl_bid_neg_rodada /.test(sql)) return 'rodadas'
+    if (/customrecord_gl_bid /.test(sql)) return 'bids'
     if (/'VendPymt'/.test(sql)) return 'pagamentos'
     if (/'VendBill'/.test(sql)) return 'contas'
     if (/'ItemRcpt'/.test(sql)) return 'recebimentos'
@@ -55,12 +61,13 @@ function qualConsulta(sql) {
     return 'reqs'
 }
 
-function montarSuitelet(param) {
+function montarSuitelet(param, falhar) {
     const consultas = []
     const query = {
         runSuiteQLPaged({ query: sql, params }) {
             const nome = qualConsulta(sql)
             consultas.push({ nome, sql, params })
+            if (falhar && falhar.test(nome)) throw new Error('Invalid search query: Search error occurred: Record customrecord_gl_bid was not found.')
             const linhas = LINHAS[nome]
             return { pageRanges: [{ index: 0 }], fetch: () => ({ data: { asMappedResults: () => linhas } }) }
         }
@@ -115,10 +122,15 @@ test('dados: periodo invalido devolve erro sem consultar', () => {
     assert.equal(consultas.length, 0)
 })
 
-test('dados: consulta as sete fontes e devolve ciclo, agregados e aviso de conta sem baixa', () => {
+test('dados: consulta as dez fontes e devolve ciclo, agregados e aviso de conta sem baixa', () => {
     const { sl, consultas } = montarSuitelet()
     const r = JSON.parse(chamar(sl, { action: 'dados', de: '2026-09-01', ate: '2026-10-19' }).corpo)
-    assert.deepEqual(consultas.map((c) => c.nome), ['reqs', 'reqNotas', 'pos', 'poNotas', 'recebimentos', 'contas', 'pagamentos'])
+    assert.deepEqual(consultas.map((c) => c.nome), ['reqs', 'reqNotas', 'pos', 'bids', 'convidados', 'rodadas', 'poNotas', 'recebimentos', 'contas', 'pagamentos'])
+    assert.deepEqual(Array.from(consultas[3].params), ['2026-09-01', '2026-10-19'])
+    assert.match(consultas.find((c) => c.nome === 'convidados').sql, /IN \(1004\)/)
+    assert.equal(r.ciclos[0].marcos.convites_enviados, '2026-09-02T11:00:00')
+    assert.equal(r.ciclos[0].marcos.propostas, '2026-09-02T15:00:00')
+    assert.equal(r.ciclos[0].bid.rectype, 4583)
     assert.deepEqual(Array.from(consultas[0].params), ['2026-09-01', '2026-10-19'])
     assert.match(consultas.find((c) => c.nome === 'pagamentos').sql, /IN \(31\)/)
     assert.equal(r.ciclos.length, 1)
@@ -147,4 +159,25 @@ test('objeto: help e description dos campos do script cabem no limite do SDF', (
     const texto = (tag) => [...xml.matchAll(new RegExp('<' + tag + '>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?</' + tag + '>', 'g'))].map((m) => m[1])
     texto('help').forEach((h) => assert.ok(h.length <= 999, 'help com ' + h.length + ' caracteres'))
     texto('description').forEach((d) => assert.ok(d.length <= 999, 'description com ' + d.length + ' caracteres'))
+})
+
+// Sandbox sem o projeto P2P - Req: o registro de Bid nao existe e o painel segue sem as fases 4.2 e 4.3.
+test('dados: sem o registro de Bid o painel funciona e avisa', () => {
+    const { sl, consultas } = montarSuitelet('', /^bids$/)
+    const r = JSON.parse(chamar(sl, { action: 'dados', de: '2026-09-01', ate: '2026-10-19' }).corpo)
+    assert.equal(r.erro, undefined)
+    assert.equal(r.ciclos[0].etapas.bid.situacao, 'sem_bid')
+    assert.ok(r.avisos.some((a) => /Bid/.test(a)))
+    assert.ok(!consultas.some((c) => c.nome === 'convidados'))
+})
+
+test('pagina: fases do manual, Bid e indicadores de conformidade aparecem', () => {
+    const { sl } = montarSuitelet()
+    const { corpo } = chamar(sl, {})
+    assert.match(corpo, /Fase ' \+ esc\(e\.fase\)/)
+    assert.match(corpo, /sem_bid/)
+    assert.match(corpo, /custrecordentry\.nl\?rectype=/)
+    assert.match(corpo, /reqMinimoCotacoes/)
+    assert.match(corpo, /pagoAntesDoRecebimento/)
+    ;['bid', 'propostas', 'negociacao'].forEach((id) => assert.match(corpo, new RegExp('COR_ETAPA = \\{[^}]*' + id + ':')))
 })

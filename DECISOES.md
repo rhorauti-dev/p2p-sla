@@ -1,7 +1,9 @@
 # p2p-sla — decisões
 
-Painel gerencial (Suitelet) do SLA do procure-to-pay por departamento: Requisição → aprovação → Pedido de
-compra → aprovação → Recebimento → Lançamento da NF → Pagamento. Somente leitura, SuiteQL.
+Painel gerencial (Suitelet) do SLA do procure-to-pay por departamento, nas fases do Manual de Procedimentos
+de Compras MPI-SUP-001 de 03/08/2026, item 4 (D7): Requisição → aprovação → Bid e convites → Propostas →
+Negociação → Pedido de compra → aprovação → Entrega e recebimento → Lançamento da NF → Pagamento. Somente
+leitura, SuiteQL.
 
 | Arquivo | Papel |
 |---|---|
@@ -35,14 +37,20 @@ recebimento), `OrdBill`/`ShipRcpt` (pedido → conta a pagar), `Payment` (conta 
 
 ## D3. Etapas e responsáveis
 
-| Etapa | De → até | Responsável | Meta padrão (dias úteis) |
-|---|---|---|---|
-| Aprovação da requisição | abertura → aprovação | Gestor do departamento | 2 |
-| Emissão do pedido | aprovação da requisição → abertura do PO | Compras | 3 |
-| Aprovação do pedido | abertura → aprovação do PO | Aprovador do pedido | 2 |
-| Entrega do fornecedor | aprovação do PO → recebimento | Fornecedor / Compras | 15 |
-| Lançamento da NF | recebimento → conta a pagar | Fiscal / Contas a pagar | 3 |
-| Pagamento | pagamento × vencimento de cada conta | Financeiro | 0 (tolerância após o vencimento) |
+| Fase do manual | Etapa | De → até | Responsável | Meta padrão (dias úteis) |
+|---|---|---|---|---|
+| 4.1 | Aprovação da requisição | abertura → aprovação | Gestor do departamento | 2 |
+| 4.2 | Bid e convites | aprovação da requisição → envio dos convites | Compras | 2 |
+| 4.2 | Propostas dos fornecedores | envio dos convites → última proposta | Fornecedores | 3 |
+| 4.3 | Negociação | última proposta → última rodada de negociação | Compras | 3 |
+| 4.4 | Emissão do pedido | última rodada (ou proposta; sem Bid, aprovação da requisição) → abertura do PO | Compras | 3 |
+| 4.5 | Aprovação do pedido | abertura → aprovação do PO | Head de Compras | 2 |
+| 4.6 a 4.8 | Entrega e recebimento | aprovação do PO → recebimento | Fornecedor / Compras / Logística | 15 |
+| 4.9 | Lançamento da NF | recebimento → conta a pagar | Fiscal / Contas a pagar | 3 |
+| 4.9 | Pagamento | pagamento × vencimento de cada conta | Financeiro | 0 (tolerância após o vencimento) |
+
+Aprovação da requisição, Bid, propostas e negociação contam uma vez por requisição (`porRequisicao`); as demais,
+uma vez por pedido. O manual não fixa prazo por fase.
 
 Pedido de **serviço** (com conta a pagar e sem recebimento): entrega "não se aplica" e o lançamento conta da
 aprovação do pedido.
@@ -76,3 +84,27 @@ Departamentos, Mensal, Responsáveis e Detalhe (números como número, filtro no
 resumo com indicadores, departamentos, evolução, responsáveis e detalhe; gráficos em JPEG (em PNG o arquivo
 passava de 7 MB). O detalhe exportado respeita a busca e o filtro de etapa da tabela. Filtro de departamento,
 subsidiária, prioridade e situação refaz a leitura do período.
+
+## D7. Fases do manual de Compras: Bid, propostas e negociação
+
+O manual MPI-SUP-001 (03/08/2026) põe entre a requisição aprovada e o pedido a fase de mercado (4.2: Bid,
+convites, no mínimo 3 cotações — item 7.1) e a negociação (4.3). No NetSuite elas acontecem no projeto
+P2P - Req; o painel lê os registros dele em vez de manter o intervalo inteiro como "Emissão do pedido".
+
+| Marco | Fonte |
+|---|---|
+| Convites enviados | `customrecord_gl_bid.custrecord_gl_bid_dt_envio` do primeiro Bid enviado da requisição (`custrecord_gl_bid_requisicao`) |
+| Propostas | última `custrecord_gl_bidforn_dt_resp` dos convidados (`customrecord_gl_bid_forn`), quando todos responderam ou quando Compras seguiu (há rodada 2+ ou pedido) |
+| Negociado | última `custrecord_gl_neg_data` de rodada 2 em diante (`customrecord_gl_bid_neg_rodada`); a rodada 1 é a proposta inicial |
+
+- **Escolha do vencedor não tem data.** A Cotação vira "Vencedor" (`custrecord_gl_cot_status` = 2) sem
+  nota de sistema: em 09/11/2026 o `systemnote` dos tipos 4583 e 4587 estava vazio em produção. A fase 4.3
+  fecha na última rodada, e a escolha do vencedor fica dentro da emissão do pedido.
+- **Sem Bid** (requisição sem Bid, ou Bid nunca enviado e pedido já emitido): as três fases ficam `sem_bid`,
+  a emissão conta da aprovação da requisição e a requisição conta no indicador "pedido sem Bid".
+- **Bid enviado, nenhuma proposta e pedido emitido:** propostas `encerrada`, negociação `nao_se_aplica`.
+- **Pedido com Bid e sem rodada 2:** negociação `nao_se_aplica`; a emissão conta da última proposta.
+- **Conformidade** nos indicadores: requisições com no mínimo 3 propostas (`MINIMO_COTACOES`) e pedidos com
+  pagamento registrado antes do recebimento (manual 4.9).
+- O link do Bid na tabela usa o `internalid` do tipo `CUSTOMRECORD_GL_BID`, lido na consulta: varia por conta.
+- Conta sem o projeto P2P - Req: a consulta de Bid falha, o painel segue com as fases em `sem_bid` e avisa.
